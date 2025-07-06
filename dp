@@ -1,0 +1,798 @@
+#!/usr/bin/python3
+
+import os
+import re
+import sys
+import math
+import signal
+import time
+import queue
+import hmac
+import json
+import base64
+import hashlib
+import urllib.request
+import urllib.parse
+import requests
+import threading
+#import websocket
+import argparse
+import logging
+
+#from websocket import create_connection
+from datetime import datetime, timedelta 
+
+######################
+# Global Vars
+args  = list()
+api_url            = "https://api.kraken.com"
+api_domain_public  = "wss://ws.kraken.com/"
+api_domain_private = "wss://ws-auth.kraken.com/"
+api_key      = None
+api_secret   = None
+api_token    = None
+coin_volume  = 0
+open_orders_data    = list()
+asset_pair_data     = list()
+asset_pair   = None
+market_price = None
+ttyred      = '\033[1;31m'
+ttygreen    = '\033[1;32m'
+ttynoco = '\033[1;0m'
+l = None
+lot_decimals  = 8
+pair_decimals = 2
+order_min = 0.0
+
+######################
+# Helper Functions
+def timeoutfunction(signalnumber, frame):
+            raise KeyboardInterrupt
+
+signal.signal(signal.SIGALRM, timeoutfunction)
+
+def goodsleep(seconds = 1, exitvalonkeyboard = None):
+    try:
+        time.sleep(seconds)
+    except KeyboardInterrupt:
+        l.debug("Received keyboard interrupt.")
+        if exitvalonkeyboard != None:
+            l.info("Received keyboard interrupt. Exiting.  Please manually verify the coin and order status.")
+            sys.exit(exitvalonkeyboard)
+        else:
+            return False
+    return True
+
+def goodnum(num):
+    if type(num) is float:
+        s = str("%0.9f" % num)
+        s = s.rstrip('0')
+        if s[-1] == '.':
+            s = s + '0'
+        return s
+    else:
+        return str(num)
+
+def floatequal(x, y):
+    if type(x) is float and type(y) is float:
+        if abs(float(x) - float(y)) <= 1e-10:
+            return True
+        else:
+            return False
+    else:
+        return False
+
+
+def mainArgs(params = None):
+    global args
+    parser = argparse.ArgumentParser(description="Kraken magic DP money script",  epilog="Use a volume of 0 to run options where you do not want to add an order. \n --cleanup or --closeall for example:")
+    parser.add_argument("--pairs", action="store_true",            help="Display all possible asset pairs available for orders")
+    parser.add_argument("--cancelall", type=str, default='NO', choices=['NO','YES'], help="Cancel ALL Kraken Orders - Big Red Button. Must use =YES")
+    parser.add_argument("type", type=str, default='buy', choices=['buy','sell'], help="Transaction type (buy|sell)")
+    parser.add_argument("pair", type=str,                          help="Coin pair to use XBTUSD,XLMUSD, ETHUSD, etc.")
+    parser.add_argument("volume", type=str,                        help="Volume - number of coin. A %% can be used to represent a %% value.")
+    parser.add_argument("--cleanup", action="store_true",          help="Cancel and remove any open orders and exit.")
+    parser.add_argument("--sell", type=str, default='0',           help="Define secondary sell after initial buy order. +%% for a sell-limit or -%% for a stop-loss conditionalEx: +5%% or -0.75%%")
+    parser.add_argument("--sellall", action="store_true",          help="Regardless of the volume specified, sell 100%% of the coin when a sell takes place. Used in alert scripts.")
+    parser.add_argument("--price", type=str, default='0',          help="Buy price. Default is current market price (0). Ex: -0.1%% or 55123")
+    parser.add_argument("--makemarket", action="store_true",       help="Change limit to market if the limit does not trigger within the defined timeout.")
+    parser.add_argument("--timeout", type=int, default=300,        help="Buy/Sell timeout in seconds. default=300, 0 indicates no timeout or expiretime")
+    parser.add_argument("--ufreq", type=int, default=60,           help="Update frequency in seconds. default=60")
+    parser.add_argument("--keyfile", type=str, default='API_Keys', help="API Keys file. default=API_Keys")
+    parser.add_argument("--verbose", action="store_true",          help="Produce verbose debug output to dp-debug.log file")
+    parser.add_argument("--status", action="store_true",          help="List current amounts of the request coins")
+    parser.add_argument("--logfile", type=str, default='dp.log',   help="Log file location.  Default=dp.log")
+    if params == None:
+        args = parser.parse_args()
+    else:
+        args = parser.parse_args(params)
+    return
+
+def startLogging():
+    global l
+    debugfile = args.logfile.split('.')[0] + '-' + args.pair.strip() + '-debug.' + args.logfile.split('.')[1] 
+    l = logging.getLogger('dp_logger')
+    l.setLevel(logging.DEBUG)
+    stdout_log = logging.StreamHandler(sys.stdout)
+
+    if args.verbose == True:
+        stdout_log.setLevel(logging.DEBUG)
+    else:
+        stdout_log.setLevel(logging.INFO)
+
+    formatter = logging.Formatter('%(asctime)s %(process)d %(lineno)-4s %(message)s',"%-m/%d %H:%M:%S")
+    stdout_log.setFormatter(formatter)
+    debug_log = logging.FileHandler(debugfile)
+    debug_log.setLevel(logging.DEBUG)
+    formatter = logging.Formatter('[%(asctime)s] %(process)d %(lineno)-4s %(message)s')
+    debug_log.setFormatter(formatter)
+    info_log = logging.FileHandler(args.logfile)
+    info_log.setLevel(logging.INFO)
+    formatter = logging.Formatter('[%(asctime)s] %(process)d %(lineno)-4s %(message)s')
+    info_log.setFormatter(formatter)
+    l.addHandler(stdout_log)
+
+    #if args.verbose == True:
+    #    l.addHandler(debug_log)
+    l.addHandler(debug_log)
+    l.addHandler(info_log)
+    return True 
+
+def get_kraken_signature(urlpath, data, secret):
+    postdata = urllib.parse.urlencode(data)
+    encoded = (str(data['nonce']) + postdata).encode()
+    message = urlpath.encode() + hashlib.sha256(encoded).digest()
+    mac = hmac.new(base64.b64decode(secret), message, hashlib.sha512)
+    sigdigest = base64.b64encode(mac.digest())
+    return sigdigest.decode()
+
+def kraken_request(uri_path, data, api_key, api_sec):
+    headers = {}
+    headers['API-Key'] = api_key
+    headers['API-Sign'] = get_kraken_signature(uri_path, data, api_sec)             
+    req = requests.post((api_url + uri_path), headers=headers, data=data)
+    return req
+
+def get_api_token():
+    global api_key
+    global api_secret
+    global api_token
+    try:
+        f = open(args.keyfile) 
+        api_key = f.readline().strip()
+        api_secret = f.readline().strip()
+        f.close()
+    except:
+        l.error("API public key and API private (secret) key must be in a text file called API_Keys or defined with --keyfile")
+        sys.exit(1)
+    for retry in range(6):    
+        # Opens the api websocket token
+        api_nonce = bytes(str(int(time.time()*1000)), "utf-8")
+        api_request = urllib.request.Request("https://api.kraken.com/0/private/GetWebSocketsToken", b"nonce=%s" % api_nonce)
+        api_secret_hash = base64.b64encode( hmac.new(base64.b64decode(api_secret), 
+            b"/0/private/GetWebSocketsToken" + hashlib.sha256(api_nonce + b"nonce=%s" % api_nonce).digest(), 
+            hashlib.sha512).digest())
+        api_request.add_header("API-Key",  api_key)
+        api_request.add_header("API-Sign", api_secret_hash)
+        try:
+            result = urllib.request.urlopen(api_request).read()
+        except:
+            l.error("get_api_token: Requesting a token failed.")
+            l.error("get_api_token: sleeping for 30 seconds before retrying.")         
+            goodsleep(30,1)
+            continue
+        api_token = json.loads(result)['result']['token']
+        return api_token
+    # If we're here that means the for loop ended which is only cause by errors.
+    l.error("get_api_token: Repeated failures occurred.  Exiting.")
+    sys.exit(129)
+
+def tickerData():
+    global market_price
+    for retry in range(10):
+        try:
+            resp = requests.get('https://api.kraken.com/0/public/Ticker?pair=%s' %  str(args.pair))
+            result = resp.json()
+            l.debug("tickerData: result = '%s'" % str(result))
+        except KeyboardInterrupt:
+            l.info("Received keyboard interrupt.")
+            sys.exit(1)    
+        except Exception as error:
+            l.error("tickerData: API call failed (%s)" % error)
+            l.error("tickerData: sleeping for 10 seconds before retrying.")         
+            goodsleep(10,1)
+            continue
+        if str(result.get('error','NA')) == '[]' :
+            # result format is like this... {'result': {'ETH/USD': {'a': ['2094.22000', '5', '5.000'], ...
+            tickerdata = result.get('result','{}')
+            ticker = next(iter(tickerdata))
+            market_price = float(tickerdata.get(ticker).get('a')[0])
+            l.debug("tickerData:  market_price = %f" % market_price)
+            return market_price
+        else:
+            l.info("tickerData:  Error was not empty.  Retrying after 10 seconds: '%s'", str(result.get('error','NA')))
+            goodsleep(10,1)
+    # If we're here that means the for loop ended which is only cause by errors.
+    l.error("tickerData: Repeated failures occurred.  Exiting.")
+    sys.exit(125)
+            
+def cancelAll():
+    try:
+        resp = kraken_request('/0/private/CancelAll', {
+            "nonce": str(int(1000*time.time()))    
+        }, api_key, api_secret)
+        result = resp.json()
+        l.info("cancelAll result = '%s'" % result)
+    except KeyboardInterrupt:
+        l.info("Received keyboard interrupt.")
+        sys.exit(1)
+    except Exception as error:
+        l.info("cancelAll API call failed (%s)" % error)
+        sys.exit(1)
+    if str(result.get('error','NA')) == '[]' :
+        result = result.get('result','{}')
+        l.info("cancelAll: data = '%s'" % str(result))
+    else:
+        l.info("cancelAll: Error was not empty. Exiting: '%s'", str(result.get('error','NA')))
+        sys.exit(1)
+    return result
+
+def addOrder(ordtype = 'limit', otype = 'buy', volume = 0, price = 0, expiretm = None):
+
+    if ordtype == 'limit':
+        command =  {
+            "nonce": str(int(1000*time.time())),
+            "ordertype": "limit",
+            "type": otype,
+            "volume": ("{:.%sf}" % lot_decimals).format(volume).rstrip('0'),
+            "pair": args.pair,
+            "price": round(price,pair_decimals)
+        }
+    elif ordtype == 'market':
+        command =  {
+            "nonce": str(int(1000*time.time())),
+            "ordertype": "market",
+            "type": otype,
+            "volume": ("{:.%sf}" % lot_decimals).format(volume).rstrip('0'),
+            "pair": args.pair
+        }
+    elif ordtype == 'stop-loss':
+        command =  {
+            "nonce": str(int(1000*time.time())),
+            "ordertype": "stop-loss",
+            "type": otype,
+            "volume": ("{:.%sf}" % lot_decimals).format(volume).rstrip('0'),
+            "pair": args.pair,
+            "price": round(price,pair_decimals)
+        }
+    if expiretm != None and ordtype != 'market':
+        if not expiretm < 1: # Trap for --timeout=0
+            command["expiretm"] = "+%s" % str(int(expiretm))
+
+    if '%' in args.sell: 
+        if '-' in args.sell:
+            # Add a conditional stop-loss to the order:
+            command["close[ordertype]"] = "stop-loss"
+            command["close[price]"]     = args.sell
+        else:
+            # Add a conditional limit to the order:
+            command["close[ordertype]"] = "limit"
+            command["close[price]"]     = args.sell
+    
+    l.debug("addOrder: command = %s" % command)
+    try:
+        resp = kraken_request('/0/private/AddOrder',command, api_key, api_secret)
+        result = resp.json()
+        #l.debug("addOrder: result = '%s'" % json.dumps(result,indent=4))
+        l.debug("addOrder: result = '%s'" % result)
+    except KeyboardInterrupt:
+        l.info("Received keyboard interrupt during addOrder - Ignoring.")
+    except Exception as error:
+        l.error("addOrder API call failed (%s)" % error)
+        sys.exit(1)
+    if str(result.get('error','NA')) == '[]' :
+        #time.sleep(3)
+        #l.debug("addOrder: Successful: '%s'" % str(result))
+        result = result.get('result','{}')
+        result = result.get('txid', None)[0]
+        l.debug("addOrder: returning %s" % result)
+        return result
+    else:
+        l.error("addOrder Error:  %s" % result['error']  )
+        return None
+        
+def openOrders():
+    global open_orders_data
+    l.debug("openOrders: Starting")
+    goodsleep(1,1)
+    for retry in range(6):
+        try:
+            resp = kraken_request('/0/private/OpenOrders', {
+                "nonce": str(int(1000*time.time())),
+                "trades": False,
+            }, api_key, api_secret)
+            result = resp.json()
+            #l.debug("openOrders: result = '%s'" % str(result))
+        except KeyboardInterrupt:
+            l.info("Received keyboard interrupt.")
+            sys.exit(1)
+        except Exception as error:
+            l.error("openOrders API call failed (%s)" % error)
+            l.error("openOrders: sleeping for 10 seconds before retrying.")         
+            goodsleep(10,1)
+            continue
+        if str(result.get('error','NA')) == '[]' :
+            # result format looks like this: {'error': [], 'result': {'open': {}}}
+            open_orders_data = result.get('result','{}').get('open','{}')
+            l.debug("openOrders: open_orders_data = '%s'" % str(open_orders_data))
+            return open_orders_data
+        else:
+            l.info("openOrders:  Error was not empty.  Retrying after 10 seconds: '%s'", str(result.get('error','Unknown Error')))
+            goodsleep(10,1)
+    # If we're here that means the for loop ended which is only cause by errors.
+    l.error("openOrders: Repeated failures occurred.  Exiting.")
+    sys.exit(127)
+    return
+
+def getOrder(txid):
+    openOrders()
+    for i in open_orders_data:
+        if i == txid or i.split('-')[0].strip() == txid.split('-')[0].strip():
+            descr = open_orders_data.get(i).get('descr')
+            l.debug("getOrder: returning %s" % descr )
+            return descr
+    return None
+
+def getAccountBalance():
+    for retry in range(10):
+        try:
+            resp = kraken_request('/0/private/Balance', {
+                "nonce": str(int(1000*time.time())),
+            }, api_key, api_secret)
+            result = resp.json()
+            #l.debug("getAccountBalance: result = '%s'" % json.dumps(result,indent=4))
+            l.debug("getAccountBalance: result = '%s'" % result)
+        except KeyboardInterrupt:
+            l.info("Received keyboard interrupt.")
+            sys.exit(1)
+        except Exception as error:
+            l.error("getAccountBalance API call failed (%s)" % error)
+            l.error("getAccountBalance: sleeping for 10 seconds before retrying.")         
+            goodsleep(10,1)
+            continue
+        if str(result.get('error','NA')) == '[]' :
+            result = result.get('result','{}')
+            l.debug("getAccountBalance: data = '%s'" % str(result))
+            return result
+        else:
+            l.info("getAccountBalance:  Error was not empty.  Retrying after 10 seconds: '%s'", str(result.get('error','NA')))
+            goodsleep(10,1)
+    # If we're here that means the for loop ended which is only cause by errors.
+    l.error("getAccountBalance: Repeated failures occurred.  Exiting.")
+    sys.exit(128)
+    return    
+
+def getTradesHistory():
+    for retry in range(10):
+        try:
+            resp = kraken_request('/0/private/TradesHistory', {
+                "nonce": str(int(1000*time.time())),
+                "trades": True
+            }, api_key, api_secret)
+            result = resp.json()
+            #l.debug("getTradesHistory: result = '%s'" % json.dumps(result,indent=4))
+            #l.debug("getTradesHistory: result = '%s'" % result)
+        except KeyboardInterrupt:
+            l.info("Received keyboard interrupt.")
+            sys.exit(1)
+        except Exception as error:
+            l.error("getTradesHistory API call failed (%s)" % error)
+            l.error("getTradesHistory: sleeping for 10 seconds before retrying.")         
+            goodsleep(10,1)
+            continue
+        if str(result.get('error','NA')) == '[]' :
+            result = result.get('result','{}')
+            result = result.get('trades','NA')
+            l.debug("getTradesHistory: data = '%s'" % str(result))
+            return result
+        else:
+            l.info("getTradesHistory:  Error was not empty.  Retrying after 10 seconds: '%s'", str(result.get('error','NA')))
+            goodsleep(10,1)
+    # If we're here that means the for loop ended which is only cause by errors.
+    l.error("getTradesHistory: Repeated failures occurred.  Exiting.")
+    sys.exit(128)
+    return          
+
+def getAssetPair(pair = None):
+    global asset_pair_data
+    global asset_pair
+    global pair_decimals
+    global lot_decimals
+    global order_min
+    result = list()
+
+    if pair == None:
+        pair = args.pair
+    if asset_pair == None:
+        try:
+            resp = requests.get('https://api.kraken.com/0/public/AssetPairs')
+            result = resp.json()
+            #l.debug("getAssetPair: result = '%s'" % str(result))
+        except KeyboardInterrupt:
+            l.info("Received keyboard interrupt.")
+            sys.exit(1)
+        except Exception as error:
+            l.error("Unable to get asset pair data from kraken. Exiting(123)")
+            sys.exit(123)
+        if str(result.get('error','NA')) == '[]' :                                                
+            asset_pair_data = result.get('result')                                       
+            #l.debug("getAssetPair asset_pair_data = '%s'" % str(asset_pair_data)) 
+        else:
+            l.error("Error getting asset pair data from kraken. Exiting(124)")
+            sys.exit(124)
+        for i in asset_pair_data:
+            payload = asset_pair_data.get(i)
+            if payload.get('altname','NA') == pair:
+                pair_decimals = int(payload.get('pair_decimals', '2'))
+                lot_decimals = int(payload.get('lot_decimals', '2'))
+                order_min = float(payload.get('ordermin', '0.0'))
+                l.debug("getAssetPair: returned asset_pair = '%s'" % i )
+                l.debug("getAssetPair: set pair_decimals,lot_decimals=%(p)g,%(l)g" % 
+                    {'p':pair_decimals, 'l':lot_decimals})
+                asset_pair = i
+                return asset_pair
+    else:
+        return asset_pair
+
+def displayAssetPairs():
+    try:
+        resp = requests.get('https://api.kraken.com/0/public/AssetPairs')
+        result = resp.json()
+    except KeyboardInterrupt:
+        l.info("Received keyboard interrupt.")
+        sys.exit(1)
+    except Exception as error:
+        l.error("Unable to get asset pair data from kraken. Exiting(123)")
+        sys.exit(123)
+
+    if str(result.get('error','NA')) == '[]' :                                                
+        asset_pair_data = result.get('result')                                       
+    else:
+        l.error("Error getting asset pair data from kraken. Exiting(124)")
+        sys.exit(124)
+    print("Pair            Order Minimum")
+    print("--------------- -------------------")
+    for i in asset_pair_data:
+        payload  = asset_pair_data.get(i)
+        altname  = payload.get('altname','NA')
+        wsname   =  payload.get('wsname','NA')
+        ordermin =  payload.get('ordermin','NA')
+        print("%(a)s  $%(m)s" % 
+            {'a':altname.ljust(15),
+             'm':ordermin
+             })
+    return
+def cancelOrder(txid):
+    try:
+        resp = kraken_request('/0/private/CancelOrder', {
+            "nonce": str(int(1000*time.time())),
+            "txid": str(txid)
+        }, api_key, api_secret)
+        result = resp.json()
+        l.debug("cancelOrder: result = '%s'" % str(result))
+    except KeyboardInterrupt:
+        l.info("Received keyboard interrupt while canceling order. Ignoring.")
+    except Exception as error:
+        l.error("cancelOrder API call failed (%s)" % error)
+        sys.exit(1)
+    if str(result.get('error','NA')) == '[]':
+        time.sleep(1)
+        l.debug("cancelOrder: %s successfully canceled" % txid)
+        return txid
+    return None
+
+######################
+def main():
+
+    global own_trades_data
+    global coin_volume
+    global winrate
+    global open_orders_data
+    global asset_pair_data
+    global market_price
+
+    if "--pairs" in sys.argv:
+        displayAssetPairs()
+        sys.exit(0)
+   
+    mainArgs()
+    startLogging()
+
+    l.debug("Arguments passed: %s" % str(args))
+    
+    # Go fetch a new API token
+    get_api_token()
+
+    if args.cancelall == 'YES':
+        l.info("Cancelling all open Kraken orders now.")
+        cancelAll()
+        sys.exit(0)
+    
+    pair = getAssetPair()
+    if pair == None:
+        l.error("The asset pair '%s' is not valid. Exiting." % args.pair)    
+        exit(1)    
+    pairdata = asset_pair_data[pair]
+    
+    price = None
+
+    accountbalance = getAccountBalance()
+    coin_volume = float(accountbalance.get(pairdata['base'],0))
+    currencyamt = accountbalance.get(pairdata['quote'],0)
+    #currencyamt = 1000
+    tickerData()
+
+    if args.status == True:
+        print("Wallet Status - %(c)s coins: %(amt)s, %(u)s currency: $%(uv)s" %
+               {'c':pairdata['base'], 'amt':goodnum(coin_volume), 'u':pairdata['quote'], 'uv':currencyamt})
+        sys.exit(0)
+
+    l.info("%(c)s market price: %(m)s, minimum order amount: %(o)s" %
+        {'c':pairdata['base'], 'm':goodnum(market_price), 'o':order_min})
+    l.info("%(c)s coins: %(amt)s, %(u)s currency: $%(uv)s" % 
+        {'c':pairdata['base'], 'amt':goodnum(coin_volume), 'u':pairdata['quote'], 'uv':currencyamt})
+    
+    price = market_price
+    changed = False
+    openOrders()
+    for i in open_orders_data:
+        txid = i
+        payload     = open_orders_data.get(txid)
+        descr       = payload.get('descr')
+        if str(args.pair) in descr.get('pair', 'NA'):
+            l.info("-- Canceling Order %(t)s: %(d)s." % 
+                {'t':txid, 'd':descr}) 
+            cancelOrder(txid)
+            changed = True
+    
+    goodsleep(5)
+
+    if changed == True:
+        accountbalance = getAccountBalance()
+        coin_volume = float(accountbalance.get(pairdata['base'],0))
+        currencyamt = accountbalance.get(pairdata['quote'],0)
+        l.info("Update after Order cancellation - %(c)s coins: %(amt)s, %(u)s currency: $%(uv)s" % 
+            {'c':pairdata['base'], 'amt':goodnum(coin_volume), 'u':pairdata['quote'], 'uv':currencyamt})
+
+    if args.cleanup == True:
+        # It was requested to cancel the orders and exit.
+        l.info("--cleanup requested. Orders cancelled and exiting.")
+        sys.exit(0)
+
+    if args.type == 'sell':
+        l.info("Sell coins requested.  Owned volume is %s." % goodnum(coin_volume))
+        if floatequal(coin_volume, 0.0):
+            l.info("No coins to sell - exiting normally.")
+            sys.exit(0)
+        l.debug("Sell - Checking for % in volume and parsing if needed.")
+        if '%' in args.volume:
+            if args.volume != '100%' and args.sellall == False:
+                # Calulate what the percentage is.  100% would equal coin_volume so no calucation is needed.
+                old_coin_volume = coin_volume
+                coin_volume = round((float(coin_volume) * (float(args.volume.split('%')[0]) / 100) ),lot_decimals) 
+                l.info("Calculated sell volume requested: %(p)s of %(o)s coins = %(c)s coins." % 
+                    {'p':args.volume, 'o':goodnum(old_coin_volume), 'c':goodnum(coin_volume)}) 
+        elif args.volume == '0':
+            l.error("Can not sell with a volume of 0.  Exiting.")
+            sys.exit(5)
+        else:
+            # Coin Volume is a actual amount...
+            coin_volume = round(float(args.volume),lot_decimals)
+            l.info("Sell volume requested: %s coins" % goodnum(coin_volume)) 
+
+        # Now check on sell price modification requests with --price...
+        if args.price == '0':
+            # A normal sell. execute.   
+            l.info("++ Creating new %(p)s sell-market order, volume %(v)s @ price $%(m)0.4f, expiration set to %(e)s" % 
+                {'p':args.pair, 'v':goodnum(coin_volume), 'm':market_price, 'e':args.timeout})
+            txid = addOrder('market', 'sell', coin_volume, 0) 
+            # +5 was used to extend beyond the manual cancel loop
+            if txid == None:
+                l.error("An Error occurred trying to create the new sell order.  Exiting.")
+                exit(201)
+        else:
+            if '%' in args.price:
+                coin_price = round(market_price + (market_price * (float(str(args.price).split('%')[0]) / 100)),pair_decimals) 
+                if '-' in args.price:
+                    ordertype = 'market'
+                else:
+                    ordertype = 'limit'
+            elif '+' in args.price or '-' in args.price:
+                coin_price = round(market_price + float(args.price),pair_decimals)
+                ordertype = 'limit'
+            else:
+                # should be an actual price
+                coin_price = round(float(args.price),pair_decimals)
+                ordertype = 'limit'
+        
+            l.info("Adjusting sell price $%(m)0.4f for --price=%(p)s consideration. New sell price: $%(c)0.4f" %
+                    {'m':market_price, 'p':args.price, 'c':coin_price})
+        
+            l.debug("Checking for market sell wait condition.") # coin price < market price
+            cancelflag = False
+            if float(coin_price) < float(market_price):
+                # Manually wait sequence...
+                l.info("oo Waiting for market price $%(m)0.4f to decrease to $%(c)0.4f to place order before timeout of %(t)s seconds" %
+                    {'m':market_price,'c':coin_price,'t':args.timeout}) 
+                expiretime = time.time() + int(args.timeout)
+                statustime = 0
+                while (coin_price < market_price):
+                    if not args.timeout < 1 and time.time() > expiretime:
+                        l.info("Reached timeout limit. Canceling order creation.")
+                        cancelflag = True
+                        break
+                    goodsleep(5,1)
+                    tickerData()
+                    if time.time() > statustime:
+                        statustime = time.time() + int(args.ufreq)
+                        l.info("  Update -- Market price: $%(m)0.4f, desired sell price: $%(e)0.4f" % {'m':market_price, 'e':coin_price})
+                if cancelflag == True:
+                    if args.makemarket == True:
+                        # So --makemarket on a limit order forces a market sell if the limit doesn't trigger.
+                        # This --makemarket is strange in that it the price requested was lower than market
+                        # which is a weird order.  This will basically sell at the current market price now.
+                        ordertype = 'market'
+                    else:
+                        # This prevent further order creation logic from occuring due to timeout.
+                        l.info("Exiting (101)")
+                        exit(101)
+                  
+            l.info("++ Creating new %(p)s sell-%(o)s order, volume %(v)s @ price $%(c)0.4f expires in %(t)0.0f seconds" % 
+                    {'p':args.pair, 'o':ordertype, 'v':goodnum(coin_volume), 'c':coin_price, 't':int(args.timeout)+20 })
+            txid = addOrder(ordertype, 'sell', coin_volume, coin_price, int(args.timeout)+20) 
+            goodsleep(2,1)
+            if txid == None:
+                l.error("An Error occurred trying to create the new sell order.  Aborting.")
+                exit(201)
+    # End sell logic
+    elif args.type == 'buy':
+        if floatequal(currencyamt, 0.0) == True:
+            l.error("There is not enough currency available to purchase coin (min=%s). Exiting."% order_min)
+            sys.exit(69)
+        if args.price == '0':
+            coin_price = market_price
+            ordertype = 'market'
+        else:
+            if '%' in args.price:
+                coin_price = round(market_price + (market_price * (float(str(args.price).split('%')[0]) / 100)),pair_decimals) 
+                if '+' in args.price:
+                    ordertype = 'market'
+                else:
+                    ordertype = 'limit'
+            elif '+' in args.price or '-' in args.price:
+                # This is for a actual price not a percentage
+                coin_price = round(market_price + float(args.price),pair_decimals)
+                ordertype = 'limit'
+            else:
+                # should be an actual price
+                coin_price = round(float(args.price),pair_decimals)
+                ordertype = 'limit'
+            
+            l.info("Adjusting market price $%(m)0.4f to price for --price=%(p)s consideration: $%(c)0.4f" %
+                    {'m':market_price, 'p':args.price, 'c':coin_price})
+        
+        l.debug("Checking for % in volume and parsing if needed.")
+        if '%' in args.volume:
+            coin_volume = round((float(currencyamt) * (float(args.volume.split('%')[0]) / 100) / coin_price),lot_decimals) 
+            l.info("Calculated volume requested: %(p)s of $%(ca)0.4f = %(c)s coins" % 
+                {'p':args.volume, 'ca':float(currencyamt), 'c':goodnum(coin_volume)}) 
+        elif args.volume == '0':
+            l.error("buy can not be created with a volume of %s.  Exiting." % args.volume)
+            sys.exit(5)
+        else:
+            coin_volume = round(float(args.volume),lot_decimals)
+        l.debug("Checking for market buy wait condition.")
+        # Detect if the price was defined but higher(long)/lower(short) than market.
+        # Start a delay in case it is to prevent an immediate market entry.
+        # This is to provide a delayed entry on a price movement you are expecting vs 
+        # What Kraken does and just enters as a market regardless.
+        # shortminusprice = (args.type == 'short' and coin_volume < market_price)
+        cancelflag = False
+        if float(coin_price) > float(market_price):
+            l.info("oo Waiting for market price $%(m)0.4f to increase to $%(c)0.4f to place order before timeout of %(t)s seconds" %
+                {'m':market_price,'c':coin_price,'t':args.timeout}) 
+            expiretime = time.time() + int(args.timeout)
+            statustime = 0
+            while (coin_price >= market_price):
+                if not args.timeout < 1 and time.time() > expiretime:
+                    l.info("Reached timeout limit. Canceling order creation.")
+                    cancelflag = True
+                    break
+                goodsleep(5,1)
+                tickerData()
+                if time.time() > statustime:
+                    statustime = time.time() + int(args.ufreq)
+                    l.info("  Update -- Market Price: $%(m)0.4f, Desired Entry Price: $%(e)0.4f" % {'m':market_price, 'e':coin_price})
+            if cancelflag == True:
+                # This prevent further order creation logic from occuring due to timeout.
+                l.info("Exiting (100)")
+                exit(100)
+                
+        l.info("++ Creating New %(p)s buy-%(o)s order, volume %(v)s @ price $%(c)0.4f expires in %(t)0.0f seconds" % 
+                {'p':args.pair, 'o':ordertype, 'v':goodnum(coin_volume), 'c':coin_price, 't':int(args.timeout)+20})
+        txid = addOrder(ordertype, 'buy', coin_volume, coin_price, int(args.timeout)+20) 
+        goodsleep(3,1)
+        if txid == None:
+            l.error("An Error occurred trying to create the new order. Exiting.")
+            exit(201)
+    # End buy logic
+    else:
+        # buy or sell was not requested.
+        l.error("Transaction type must be buy or sell.  Exiting")
+        sys.exit(107)
+
+    # If we're here it's time to provide status on the order...
+    if args.makemarket == True:
+        if args.timeout < 1:
+            l.error("Error: The option --makemarket was requested with a timeout value of %s. Exiting." % args.timeout)
+            sys.exit(678)
+        # We need to wait for the order to execute or cancel it.
+        # Expiretime will execute on a normal order without makemarket so we don't need to stick around for it otherwise.
+        goodsleep(2,1) 
+        l.info("oo Waiting up to %(timeout)s seconds for %(txid)s to close or cancel..." % {"timeout":int(args.timeout), 'txid':txid})
+        expiretime = time.time() + int(args.timeout)
+        orderdetail = 'NotNone'
+        while not orderdetail == None:
+            if time.time() > expiretime:
+                l.info("Reached timeout limit. Canceling order %(txid)s" % {'txid':txid})
+                if cancelOrder(txid) != None:
+                    l.info("Order %s canceled successfully." % txid)
+                else:
+                    l.error("There was a problem canceling order %s. Manual intervention may be needed. Continuing anyway..." % txid)
+                # Check for --makemarket option...
+                if args.makemarket == True:
+                    l.info("The option --makemarket was requested.  Re-submitting the canceled order as a market order.")
+                    l.info("++ Creating New %(p)s %(t)s-market order, volume %(v)s" % 
+                        {'p':args.pair, 't':args.type, 'v':goodnum(coin_volume)})
+                    txid = addOrder('market', args.type, coin_volume, 0) 
+                    if txid == None:
+                        l.error("An Error occurred trying to create the new market order for --makemarket.  Aborting.")
+                        sys.exit(201)
+                    goodsleep(5,1)
+                break
+            orderdetail = getOrder(txid)
+            l.debug("orderdetail = %s" % orderdetail)
+            if goodsleep(3) == False:
+                l.info("Received keyboard interrupt. Attempting to cancel order to abort...")
+                if cancelOrder(txid) != None:
+                    l.info("Order %s canceled successfully." % txid)
+                sys.exit(300)
+
+    # Provide final status update...
+    goodsleep(5)
+
+    # Report on openOrders that are remaining...
+    openOrders()
+    for i in open_orders_data:
+        txid = i
+        payload     = open_orders_data.get(txid)
+        descr       = payload.get('descr')
+        if str(args.pair) in descr.get('pair', 'NA'):
+            l.info("Remaining openOrder: %(t)s: %(d)s." % 
+                {'t':txid, 'd':descr}) 
+    accountbalance = getAccountBalance()
+    coin_volume = float(accountbalance.get(pairdata['base'],0))
+    currencyamt = accountbalance.get(pairdata['quote'],0)
+    l.info("Final update after %(t)s - %(c)s coins: %(amt)s, %(u)s currency: $%(uv)s" % 
+        {'c':pairdata['base'], 't':args.type, 'amt':goodnum(coin_volume), 'u':pairdata['quote'], 'uv':currencyamt})
+    
+    sys.exit(0)
+    
+    l.info("Exiting normally.")
+    sys.exit(0)
+
+
+
+######################
+if __name__ == "__main__":
+        main()
