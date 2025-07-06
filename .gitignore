@@ -1,0 +1,33 @@
+# Ignore everything by default
+*
+
+# Allow only the 19 essential Python files
+!main.py
+!config.py
+!data_fetching.py
+!data_loading.py
+!dynamic_confluence_engine.py
+!dynamic_confluence_ml.py
+!enhanced_trading.py
+!feature_engineering.py
+!generate_all_ohlc.py
+!incremental_cache.py
+!indicator_utils.py
+!logging_setup.py
+!models.py
+!price_and_hyperparameters.py
+!shadow_trading_system.py
+!simple_cache_logic.py
+!timeframe_merging.py
+
+# Allow scripts and binary
+!gobbler.sh
+!dp
+
+# Allow ALL .md files
+!*.md
+
+# Allow essential config files
+!requirements.txt
+!bot_dependencies.txt
+!.gitignore
