@@ -1,6 +1,7 @@
 #!/bin/bash
 
-# Version: 1.5 - CRITICAL FIX for BASE_CURRENCY extraction from ADAUSDT pairs
+# Version: 1.6 - Added email notifications for buy/sell completions
+# CRITICAL FIX for BASE_CURRENCY extraction from ADAUSDT pairs
 # Fixed USDT vs ZUSD currency detection and proper regex parsing
 # FIXED: BASE_CURRENCY now correctly extracts "ADA" from "ADAUSDT" instead of "ADAUSDT"
 
@@ -59,6 +60,30 @@ log_structured() {
     echo "$(date '+%Y-%m-%d %H:%M:%S %Z') - $LEVEL - $USER - $MESSAGE" >> "$KRAKEN_LOG"
 }
 
+# Email notification function
+send_trade_alert() {
+    local ACTION=$1
+    local USER=$2
+    local VOLUME=$3
+    local PRICE=$4
+    local PAIR=$5
+    local PROFIT=$6
+    
+    # Send to notification API
+    curl -s -X POST http://localhost:5001/notify \
+      -H "Content-Type: application/json" \
+      -d "{
+        \"action\": \"$ACTION\",
+        \"user\": \"$USER\",
+        \"volume\": \"$VOLUME\",
+        \"price\": \"$PRICE\",
+        \"pair\": \"$PAIR\",
+        \"profit\": \"$PROFIT\"
+      }" > /dev/null 2>&1
+    
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - ALERT - Trade notification sent: $ACTION $VOLUME $PAIR @ \$$PRICE for $USER (profit: \$$PROFIT)" >> "$KRAKEN_LOG"
+}
+
 # Check if bc is installed
 if ! command -v bc >/dev/null 2>&1; then
     echo "Error: 'bc' command not found. Please install bc to perform calculations." >&2
@@ -97,12 +122,12 @@ if [ "$ACTION" == "balance" ]; then
 
     # Convert pair to Kraken format and extract base currency
     TRADE_PAIR=$(echo "$PAIR" | tr -d '/')
-    
+
     # CRITICAL FIX: Extract base currency properly from pairs like ADAUSDT
     # Old (broken): BASE_CURRENCY=$(echo "$PAIR" | cut -d'/' -f1)  # ADAUSDT -> ADAUSDT (no slash!)
     # New (fixed): Remove USDT/USD suffix to get base currency
     BASE_CURRENCY=$(echo "$PAIR" | sed 's/USDT$//' | sed 's/USD$//')  # ADAUSDT -> ADA
-    
+
     echo "DEBUG: PAIR=$PAIR, BASE_CURRENCY=$BASE_CURRENCY, TRADE_PAIR=$TRADE_PAIR" >&2
 
     TOTAL_USD=0
@@ -132,7 +157,7 @@ if [ "$ACTION" == "balance" ]; then
 
             # Extract base currency balance - NOW USING CORRECT BASE_CURRENCY
             USER_BASE=$(echo "$BALANCE_OUTPUT" | sed -n "s/.*$BASE_CURRENCY coins: \([0-9]*\.[0-9]*\).*/\1/p")
-            
+
             echo "DEBUG: Looking for '$BASE_CURRENCY coins:' in output, found: '$USER_BASE'" >&2
 
             # Set to 0 if empty or not found
@@ -386,6 +411,10 @@ do
                 ORDER_ID=$(echo "$OUTPUT" | grep -i "order.*id" | sed 's/.*id[^0-9A-Za-z]*\([0-9A-Za-z-]*\).*/\1/' || echo "unknown")
 
                 log_structured "INFO" "Buy succeeded, volume: $VOLUME_COINS, profit: \$$PREDICTED_PROFIT" "$USER"
+                
+                # Send email notification for successful buy
+                send_trade_alert "BUY" "$USER" "$VOLUME_COINS" "$PRICE" "$PAIR" "$PREDICTED_PROFIT"
+                
                 output_result "success" "$USER" "$VOLUME_COINS" "$PRICE" "$PREDICTED_PROFIT" "$ORDER_ID" ""
             fi
         else
@@ -460,6 +489,10 @@ do
                 ACTUAL_PROFIT=$(echo "$OUTPUT" | grep -o "Profit: \$[0-9.]*" | sed 's/Profit: \$//' || echo "$PREDICTED_PROFIT")
 
                 log_structured "INFO" "Sell succeeded, volume: $VOLUME_COINS, profit: \$$ACTUAL_PROFIT" "$USER"
+                
+                # Send email notification for successful sell
+                send_trade_alert "SELL" "$USER" "$VOLUME_COINS" "$PRICE" "$PAIR" "$ACTUAL_PROFIT"
+                
                 output_result "success" "$USER" "$VOLUME_COINS" "$PRICE" "$ACTUAL_PROFIT" "$ORDER_ID" ""
             fi
         else
