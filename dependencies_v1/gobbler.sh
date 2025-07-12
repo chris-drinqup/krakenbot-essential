@@ -1,7 +1,8 @@
 #!/bin/bash
 
-# Version: 1.4 - FINAL FIX for balance parsing using sed instead of grep
+# Version: 1.5 - CRITICAL FIX for BASE_CURRENCY extraction from ADAUSDT pairs
 # Fixed USDT vs ZUSD currency detection and proper regex parsing
+# FIXED: BASE_CURRENCY now correctly extracts "ADA" from "ADAUSDT" instead of "ADAUSDT"
 
 # Copyright (c) 2025 Chris Barringer
 # All rights reserved.
@@ -20,8 +21,16 @@ LOCK_TIMEOUT=300  # 5 minutes lock timeout
 # Handle balance command with different parameter order
 if [ "$ACTION" == "balance" ]; then
     PAIR=$2
-    PID=$3
-    FORMAT_OPTION=$4
+    # Flexible parameter parsing: handle both with and without PID
+    if [ "$3" = "--format=json" ]; then
+        # Called without PID: balance ADAUSDT --format=json
+        PID=""
+        FORMAT_OPTION=$3
+    else
+        # Called with PID: balance ADAUSDT 101763 --format=json
+        PID=$3
+        FORMAT_OPTION=$4
+    fi
 fi
 
 # Set up log file path - fix the log file detection
@@ -72,7 +81,7 @@ detect_usd_currency() {
 extract_usd_balance() {
     local BALANCE_TEXT=$1
     local USD_CURRENCY=$(detect_usd_currency "$BALANCE_TEXT")
-    
+
     if [ "$USD_CURRENCY" = "USDT" ]; then
         echo "$BALANCE_TEXT" | sed -n 's/.*USDT currency: \$\([0-9]*\.[0-9]*\).*/\1/p'
     elif [ "$USD_CURRENCY" = "ZUSD" ]; then
@@ -88,7 +97,13 @@ if [ "$ACTION" == "balance" ]; then
 
     # Convert pair to Kraken format and extract base currency
     TRADE_PAIR=$(echo "$PAIR" | tr -d '/')
-    BASE_CURRENCY=$(echo "$PAIR" | cut -d'/' -f1)  # e.g., ADA from ADAUSD, XRP from XRPUSD
+    
+    # CRITICAL FIX: Extract base currency properly from pairs like ADAUSDT
+    # Old (broken): BASE_CURRENCY=$(echo "$PAIR" | cut -d'/' -f1)  # ADAUSDT -> ADAUSDT (no slash!)
+    # New (fixed): Remove USDT/USD suffix to get base currency
+    BASE_CURRENCY=$(echo "$PAIR" | sed 's/USDT$//' | sed 's/USD$//')  # ADAUSDT -> ADA
+    
+    echo "DEBUG: PAIR=$PAIR, BASE_CURRENCY=$BASE_CURRENCY, TRADE_PAIR=$TRADE_PAIR" >&2
 
     TOTAL_USD=0
     TOTAL_BASE=0
@@ -115,8 +130,10 @@ if [ "$ACTION" == "balance" ]; then
             # FIXED: Parse the --status output using dynamic USD currency detection
             USER_USD=$(extract_usd_balance "$BALANCE_OUTPUT")
 
-            # Extract base currency balance
+            # Extract base currency balance - NOW USING CORRECT BASE_CURRENCY
             USER_BASE=$(echo "$BALANCE_OUTPUT" | sed -n "s/.*$BASE_CURRENCY coins: \([0-9]*\.[0-9]*\).*/\1/p")
+            
+            echo "DEBUG: Looking for '$BASE_CURRENCY coins:' in output, found: '$USER_BASE'" >&2
 
             # Set to 0 if empty or not found
             if [ -z "$USER_USD" ] || [ "$USER_USD" = "" ]; then
@@ -167,7 +184,8 @@ fi
 
 # Convert pair to Kraken format and extract base currency
 TRADE_PAIR=$(echo "$PAIR" | tr -d '/')
-BASE_CURRENCY=$(echo "$PAIR" | cut -d'/' -f1)  # e.g., ADA from ADAUSD, XRP from XRPUSD
+# CRITICAL FIX: Extract base currency properly from pairs like ADAUSDT
+BASE_CURRENCY=$(echo "$PAIR" | sed 's/USDT$//' | sed 's/USD$//')  # ADAUSDT -> ADA
 
 # Enhanced lock management with timeout
 create_lock_with_timeout() {
@@ -327,7 +345,7 @@ do
             if [ -z "$USD_BALANCE" ]; then
                 USD_BALANCE="0.0"
             fi
-            
+
             BASE_BALANCE=$(echo "$OUTPUT" | grep "$BASE_CURRENCY coins" | head -n1 | sed "s/.*$BASE_CURRENCY coins: //; s/,.*//" | tr -d '[:space:]' || echo "0.0")
             VOLUME_COINS=$(echo "$OUTPUT" | grep "Calculated volume requested" | sed 's/.*= //; s/ coins//' | tr -d '[:space:]' || echo "0.0")
 
@@ -401,7 +419,7 @@ do
             if [ -z "$USD_BALANCE" ]; then
                 USD_BALANCE="0.0"
             fi
-            
+
             BASE_BALANCE=$(echo "$OUTPUT" | grep "$BASE_CURRENCY coins" | head -n1 | sed "s/.*$BASE_CURRENCY coins: //; s/,.*//" | tr -d '[:space:]' || echo "0.0")
             VOLUME_COINS=$(echo "$OUTPUT" | grep "Calculated volume requested" | sed 's/.*= //; s/ coins//' | tr -d '[:space:]' || echo "0.0")
 
